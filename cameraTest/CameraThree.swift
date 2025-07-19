@@ -15,6 +15,7 @@ class CameraThree: UIViewController, AVCapturePhotoCaptureDelegate,CLLocationMan
     var captureSession: AVCaptureSession!
     var previewLayer: AVCaptureVideoPreviewLayer!
     private let photoOutput = AVCapturePhotoOutput()
+    private var currentInput: AVCaptureDeviceInput?
     
     // 位置情報管理
     private let locationManager = CLLocationManager()
@@ -22,6 +23,23 @@ class CameraThree: UIViewController, AVCapturePhotoCaptureDelegate,CLLocationMan
     
     // ヘルスケア(歩数)
     private let stepsHK = StepsHealthKit()
+    
+//    グリッドの表示状態フラグ
+    private var isGridVisible = false
+    private var gridLayer: CAShapeLayer?
+    
+    /// ズーム倍率管理
+    private var minZoomFactor: CGFloat = 1.0
+    private var maxZoomFactor: CGFloat = 1.0
+    private var currentZoomFactor: CGFloat = 1.0
+    
+//    現在の露出バイアス値とジェスチャー開始時のバイアスを覚えておく
+    private var initialExposureBias: Float = 0
+    
+    // 露出バイアスの内部状態
+    private var minExposureFactor: Float = 0
+    private var maxExposureFactor: Float = 0
+    private var currentExposureFactor: Float = 0
     
     // 撮影ボタン
     private lazy var captureButton: UIButton = {
@@ -45,6 +63,29 @@ class CameraThree: UIViewController, AVCapturePhotoCaptureDelegate,CLLocationMan
         return btn
     }()
     
+//    グリッドトグルボタン
+    private lazy var gridToggleButton: UIButton = {
+        let b = UIButton(type: .system)
+        // SF Symbol のグリッドアイコン
+        let config = UIImage.SymbolConfiguration(pointSize: 24, weight: .regular)
+        let icon = UIImage(systemName: "square.grid.3x3", withConfiguration: config)
+        b.setImage(icon, for: .normal)
+        b.tintColor = .white
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.addTarget(self, action: #selector(didTapGridToggle), for: .touchUpInside)
+        return b
+    }()
+    
+    /// 露出バイアスを可視化する縦向きゲージ
+    private lazy var exposureGauge: UIProgressView = {
+        let g = UIProgressView(progressViewStyle: .bar)
+        g.transform = CGAffineTransform(rotationAngle: .pi)
+        g.trackTintColor    = UIColor.white.withAlphaComponent(0.3)
+        g.progressTintColor = UIColor.systemYellow
+        g.translatesAutoresizingMaskIntoConstraints = false
+        return g
+    }()
+    
     override func viewDidLoad() {
         super.viewDidLoad()
 
@@ -55,16 +96,72 @@ class CameraThree: UIViewController, AVCapturePhotoCaptureDelegate,CLLocationMan
         locationManager.delegate = self
         locationManager.requestWhenInUseAuthorization()
         locationManager.startUpdatingLocation()
+        
+//        明るさスライド用パンジェスチャー
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(handleExposurePan(_:)))
+        pan.minimumNumberOfTouches = 1
+        pan.maximumNumberOfTouches = 1
+        view.addGestureRecognizer(pan)
 
-        setupCaptureSession()
         setupPreview()
         setupUI()
+        setupZoom()
+        startSession()
+        setupTapToFocus()
 
         // セッションの開始
         DispatchQueue.global(qos: .userInitiated).async {
             self.captureSession.startRunning()
         }
     }
+    
+    private func setupZoom() {
+        guard let device = currentInput?.device else { return }
+
+        // 露出バイアス
+        minExposureFactor    = device.minExposureTargetBias
+        maxExposureFactor    = device.maxExposureTargetBias
+        currentExposureFactor = device.exposureTargetBias
+
+        // ズーム倍率
+        minZoomFactor    = device.minAvailableVideoZoomFactor
+        maxZoomFactor    = device.maxAvailableVideoZoomFactor
+        currentZoomFactor = 1.0
+
+        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+        view.addGestureRecognizer(pinch)
+    }
+    
+//    プレビューをタップしたらフォーカス／露出を合わせるジェスチャーを登録
+    private func setupTapToFocus() {
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleTapToFocus(_:)))
+        view.addGestureRecognizer(tap)
+    }
+    
+    // ピンチに応じてズーム倍率を変える
+     @objc private func handlePinch(_ pinch: UIPinchGestureRecognizer) {
+         guard let device = currentInput?.device else { return }
+         
+         // ジェスチャーのスケールから新しい倍率を計算
+         var newZoom = currentZoomFactor * pinch.scale
+         // min/max の範囲にクランプ
+         newZoom = max(minZoomFactor, min(newZoom, maxZoomFactor))
+         
+         do {
+             try device.lockForConfiguration()
+             // 即時ズーム（滑らかにしたいときは ramp(toVideoZoomFactor:withRate:) を使えます）
+             device.videoZoomFactor = newZoom
+             device.unlockForConfiguration()
+         } catch {
+             print("ズーム設定に失敗: \(error)")
+         }
+         
+         if pinch.state == .ended {
+             // ジェスチャー終わりで current を更新、scale をリセット
+             currentZoomFactor = newZoom
+             pinch.scale = 1.0
+         }
+     }
     
     @objc private func didTapCancel() {
         // モーダルを閉じる
@@ -75,6 +172,120 @@ class CameraThree: UIViewController, AVCapturePhotoCaptureDelegate,CLLocationMan
       let settings = AVCapturePhotoSettings()
       // (必要ならフラッシュ設定などいじる)
       photoOutput.capturePhoto(with: settings, delegate: self)
+    }
+    
+//    タップ位置をデバイス座標に変換してフォーカス＆露出
+    @objc private func handleTapToFocus(_ gesture: UITapGestureRecognizer) {
+        // ① タップ位置（画面座標）
+        let locationInView = gesture.location(in: view)
+        // ② デバイス座標（0…1）に変換
+        let devicePoint = previewLayer.captureDevicePointConverted(fromLayerPoint: locationInView)
+        
+        guard
+          let device = currentInput?.device,
+          device.isFocusPointOfInterestSupported,
+          device.isExposurePointOfInterestSupported
+        else { return }
+        
+        do {
+            try device.lockForConfiguration()
+            
+            // フォーカス
+            device.focusPointOfInterest = devicePoint
+            device.focusMode = .autoFocus
+            
+            // 露出
+            device.exposurePointOfInterest = devicePoint
+            device.exposureMode = .autoExpose
+            
+            // 追加: 露出とフォーカスをロックしたい場合は以下を有効化
+            // device.exposureMode = .locked
+            
+            device.unlockForConfiguration()
+            
+            // （おまけ）フォーカス位置を示すアニメーションを追加するとUXが向上します
+            animateFocusIndicator(at: locationInView)
+            
+        } catch {
+            print("フォーカス／露出設定に失敗: \(error)")
+        }
+    }
+    
+    /// 上下スワイプで露出ターゲットバイアスを調整する
+    @objc private func handleExposurePan(_ pan: UIPanGestureRecognizer) {
+        guard let device = currentInput?.device,
+              device.isExposureModeSupported(.continuousAutoExposure)
+        else { return }
+
+        // ジェスチャー開始時に現在のバイアスを記憶
+        if pan.state == .began {
+            initialExposureBias = device.exposureTargetBias
+        }
+
+        // 縦移動量を取得（上にスワイプすると y は負、下は正）
+        let translation = pan.translation(in: view)
+        // 感度：200pt のスワイプでバイアスをフルレンジ変える
+        let maxBias = device.maxExposureTargetBias
+        let minBias = device.minExposureTargetBias
+        let delta = Float(-translation.y / 2000) * (maxBias - minBias)  // 上スワイプでプラス方向
+
+        // 新しいバイアスを clamp
+        let newBias = max(minBias, min(maxBias, initialExposureBias + delta))
+
+        do {
+            try device.lockForConfiguration()
+            device.setExposureTargetBias(newBias, completionHandler: nil)
+            device.unlockForConfiguration()
+        } catch {
+            print("露出バイアス設定失敗: \(error)")
+        }
+        
+        // ジェスチャー終了で翻訳量をリセット（次回の変化量計算を簡単に）
+        if pan.state == .ended || pan.state == .cancelled {
+            pan.setTranslation(.zero, in: view)
+        }
+        
+        let normalized = (newBias - minExposureFactor) / (maxExposureFactor - minExposureFactor)
+        exposureGauge.setProgress(normalized, animated: true)
+    }
+    
+    @objc private func exposureSliderChanged(_ slider: UISlider) {
+        guard let device = currentInput?.device,
+              device.isExposureModeSupported(.continuousAutoExposure) else { return }
+
+        let bias = slider.value
+        do {
+            try device.lockForConfiguration()
+            device.setExposureTargetBias(bias, completionHandler: nil)
+            device.unlockForConfiguration()
+        } catch {
+            print("露出バイアス設定に失敗: \(error)")
+        }
+        // 内部状態も更新
+        currentExposureFactor = bias
+    }
+
+    /// タップ位置に小さな円を一瞬表示して「ここに合わせたよ」を可視化
+    private func animateFocusIndicator(at point: CGPoint) {
+        let focusView = UIView(frame: CGRect(x: 0, y: 0, width: 80, height: 80))
+        focusView.center = point
+        focusView.layer.borderColor = UIColor.white.cgColor
+        focusView.layer.borderWidth = 2
+        focusView.backgroundColor = .clear
+        focusView.alpha = 0
+        view.addSubview(focusView)
+        
+        UIView.animateKeyframes(withDuration: 0.8, delay: 0, options: [], animations: {
+            UIView.addKeyframe(withRelativeStartTime: 0, relativeDuration: 0.2) {
+                focusView.alpha = 1
+                focusView.transform = CGAffineTransform(scaleX: 0.7, y: 0.7)
+            }
+            UIView.addKeyframe(withRelativeStartTime: 0.2, relativeDuration: 0.6) {
+                focusView.alpha = 0
+            }
+        }, completion: { _ in
+            focusView.removeFromSuperview()
+        })
     }
     
     // カメラ映像のレイヤーを設置
@@ -103,6 +314,25 @@ class CameraThree: UIViewController, AVCapturePhotoCaptureDelegate,CLLocationMan
           captureButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
           captureButton.widthAnchor.constraint(equalToConstant: 64),
           captureButton.heightAnchor.constraint(equalToConstant: 64),
+        ])
+        
+        view.addSubview(switchButton)
+        NSLayoutConstraint.activate([
+            switchButton.leadingAnchor.constraint(equalTo: captureButton.trailingAnchor, constant: 100),
+            switchButton.centerYAnchor.constraint(equalTo: captureButton.centerYAnchor),
+            switchButton.widthAnchor.constraint(equalToConstant: 40),
+            switchButton.heightAnchor.constraint(equalToConstant: 40),
+        ])
+        
+        view.addSubview(gridToggleButton)
+        NSLayoutConstraint.activate([
+            // captureButton の左側 20pt
+            gridToggleButton.trailingAnchor.constraint(equalTo: captureButton.leadingAnchor, constant: -100),
+            // captureButton と同じ縦位置
+            gridToggleButton.centerYAnchor.constraint(equalTo: captureButton.centerYAnchor),
+            // 適当なサイズ
+            gridToggleButton.widthAnchor.constraint(equalToConstant: 40),
+            gridToggleButton.heightAnchor.constraint(equalToConstant: 40),
         ])
     }
 
@@ -148,6 +378,40 @@ class CameraThree: UIViewController, AVCapturePhotoCaptureDelegate,CLLocationMan
         // ボタンの背面に追加
         captureButton.layer.insertSublayer(ringLayer, at: 0)
     }
+    
+    /// ３×３グリッドをプレビューの上に重ねる
+   private func addGridOverlay() {
+       // 既存のグリッドを消す
+       gridLayer?.removeFromSuperlayer()
+
+       // 新しいグリッド用の CAShapeLayer を生成
+       let layer = CAShapeLayer()
+       let path = UIBezierPath()
+       let w = view.bounds.width
+       let h = view.bounds.height
+
+       // 縦線（幅を1/3・2/3の位置に引く）
+       for i in 1...2 {
+           let x = CGFloat(i) * w / 3
+           path.move(to: CGPoint(x: x, y: 0))
+           path.addLine(to: CGPoint(x: x, y: h))
+       }
+       // 横線（高さを1/3・2/3の位置に引く）
+       for i in 1...2 {
+           let y = CGFloat(i) * h / 3
+           path.move(to: CGPoint(x: 0, y: y))
+           path.addLine(to: CGPoint(x: w, y: y))
+       }
+
+       layer.path = path.cgPath
+       layer.strokeColor = UIColor.white.withAlphaComponent(0.6).cgColor
+       layer.lineWidth = 1
+       layer.fillColor = UIColor.clear.cgColor
+
+       // プレビュー層の上に追加
+       view.layer.addSublayer(layer)
+       gridLayer = layer
+   }
 
     // カメラの向きを調整する関数
     func videoOrientation() -> AVCaptureVideoOrientation {
@@ -168,6 +432,13 @@ class CameraThree: UIViewController, AVCapturePhotoCaptureDelegate,CLLocationMan
         guard let device = AVCaptureDevice.default(for: .video) else {
             print("カメラが見つかりません")
             return
+        }
+        
+        if let backInput = makeDeviceInput(position: .back) {
+            captureSession.addInput(backInput)
+            currentInput = backInput
+        } else {
+            print("バックカメラの入力作成に失敗")
         }
 
         do {
@@ -192,6 +463,70 @@ class CameraThree: UIViewController, AVCapturePhotoCaptureDelegate,CLLocationMan
         // 出力設定（フレームレートなど）
         if let connection = output.connection(with: .video) {
            connection.videoOrientation = videoOrientation() // 画面の向きに合わせて調整
+        }
+    }
+    
+    private func makeDeviceInput(position: AVCaptureDevice.Position) -> AVCaptureDeviceInput? {
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInWideAngleCamera],
+            mediaType: .video,
+            position: position
+        )
+        guard let device = discovery.devices.first,
+              let input = try? AVCaptureDeviceInput(device: device)
+        else { return nil }
+        return input
+    }
+    
+    private func startSession() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.captureSession.startRunning()
+        }
+    }
+    
+    // MARK: — UI
+    private lazy var switchButton: UIButton = {
+        let b = UIButton(type: .system)
+        // SF Symbol のアイコンをセット
+        let icon = UIImage(systemName: "camera.rotate")
+        b.setImage(icon, for: .normal)
+        b.tintColor = .white      // アイコンの色
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.addTarget(self, action: #selector(didTapSwitch), for: .touchUpInside)
+        return b
+    }()
+    
+    // MARK: — 切り替え処理
+    @objc private func didTapSwitch() {
+        guard let currentInput = currentInput else { return }
+
+        captureSession.beginConfiguration()
+        captureSession.removeInput(currentInput)
+
+        let newPosition: AVCaptureDevice.Position = (currentInput.device.position == .back)
+            ? .front
+            : .back
+
+        if let newInput = makeDeviceInput(position: newPosition),
+           captureSession.canAddInput(newInput) {
+            captureSession.addInput(newInput)
+            self.currentInput = newInput
+        } else {
+            // 切り替え失敗時は元に戻す
+            captureSession.addInput(currentInput)
+        }
+
+        captureSession.commitConfiguration()
+    }
+    
+    @objc private func didTapGridToggle() {
+        isGridVisible.toggle()
+        if isGridVisible {
+            addGridOverlay()
+            gridToggleButton.tintColor = .systemYellow  // 押された見た目
+        } else {
+            gridLayer?.removeFromSuperlayer()
+            gridToggleButton.tintColor = .white
         }
     }
 
