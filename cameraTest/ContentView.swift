@@ -13,13 +13,21 @@ struct ContentView: View {
 
     var body: some View {
         VStack {
-            Button("カメラ起動（AVCaptureSession）") {
+            Button("カメラ起動（AVCaptureSession）ファイル別") {
                 isShowingCamera = true
             }
             .fullScreenCover(isPresented: $isShowingCamera) {
-                CameraThreeView()
+                CameraViewController()
                     .edgesIgnoringSafeArea(.all)
             }
+            
+//            Button("カメラ起動（AVCaptureSession）") {
+//                isShowingCamera = true
+//            }
+//            .fullScreenCover(isPresented: $isShowingCamera) {
+//                CameraThreeView()
+//                    .edgesIgnoringSafeArea(.all)
+//            }
             
 //            Button("カメラ起動:白い背景") {
 //                isShowingCamera = true

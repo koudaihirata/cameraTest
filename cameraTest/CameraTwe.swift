@@ -11,14 +11,14 @@ import AVFoundation
 
 /// SwiftUI のシートに「真っ白ページ」を出すラッパー
 struct ImagePickerWhite: UIViewControllerRepresentable {
-    func makeUIViewController(context: Context) -> CameraViewController {
-        CameraViewController()
+    func makeUIViewController(context: Context) -> CameraView {
+        CameraView()
     }
-    func updateUIViewController(_ uiViewController: CameraViewController, context: Context) {}
+    func updateUIViewController(_ uiViewController: CameraView, context: Context) {}
 }
 
 /// 中身は真っ白な UIViewController。表示されたらすぐカメラを起動する
-class CameraViewController: UIViewController,
+class CameraView: UIViewController,
                             UIImagePickerControllerDelegate,
                             UINavigationControllerDelegate {
 

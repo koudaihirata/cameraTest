@@ -585,7 +585,7 @@ class CameraThree: UIViewController, AVCapturePhotoCaptureDelegate,CLLocationMan
     }
 }
 
-class PhotoPreviewViewController: UIViewController, UITextFieldDelegate {
+class PhotoPreviewV: UIViewController, UITextFieldDelegate {
     private let image: UIImage
     private let coordinate: CLLocationCoordinate2D?
     private let steps: Int
